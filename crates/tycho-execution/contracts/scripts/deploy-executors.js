@@ -64,6 +64,7 @@ const deploy_protocols = {
         "fallback:rfq:bebop",
         "fallback:rfq:native",
         "pancakeswap_infinity_cl",
+        "pamm:tessera",
     ],
     "unichain": [
         "uniswap_v2",
