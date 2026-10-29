@@ -28,6 +28,7 @@ use crate::{
         dynamic_contract_indexer::{
             dci::DynamicContractIndexer, hooks::hook_dci::UniswapV4HookDCI,
         },
+        sent_blocks::{ReplayAction, SentBlocks},
         DeltaCommand, ExtractionError, Extractor, ExtractorExtension, ExtractorMsg,
     },
     pb::sf::substreams::rpc::v2::BlockScopedData,
@@ -255,11 +256,128 @@ pub(crate) fn slow_client_removals(id: &ExtractorIdentity) -> metrics::Counter {
 
 pub(crate) type SubscriptionsMap = HashMap<u64, Subscriber>;
 
+/// The subscribers of one extractor, and the record of the full blocks they received.
+///
+/// The supervisor keeps it across restarts and gives a clone to each runner.
+#[derive(Clone)]
+pub struct SubscriberChannels {
+    subscriptions: Arc<Mutex<SubscriptionsMap>>,
+    sent_blocks: Arc<std::sync::Mutex<SentBlocks>>,
+    slow_client_removals: metrics::Counter,
+}
+
+impl SubscriberChannels {
+    pub(crate) fn new(id: &ExtractorIdentity) -> Self {
+        Self {
+            subscriptions: Arc::default(),
+            sent_blocks: Arc::default(),
+            slow_client_removals: slow_client_removals(id),
+        }
+    }
+
+    /// Registers `subscriber` as subscriber `subscriber_id`.
+    pub(crate) async fn add(&self, subscriber_id: u64, subscriber: Subscriber) {
+        self.subscriptions
+            .lock()
+            .await
+            .insert(subscriber_id, subscriber);
+    }
+
+    /// Makes the next runner replay the blocks the subscribers received, instead of a restart.
+    /// Returns `false` when they received no full block, so they must get `ExtractorRestarted`.
+    pub(crate) fn begin_replay(&self) -> bool {
+        self.lock_sent_blocks().begin_replay()
+    }
+
+    /// Sends `ExtractorRestarted` to every subscriber, and forgets the blocks they received.
+    ///
+    /// Sent on the same channels as block messages, so it arrives after every block a runner
+    /// sent before. Each subscriber decides how to react: `PendingDeltas` folds its committed
+    /// blocks and clears its window, the WS service ends the affected client subscriptions.
+    pub(crate) async fn send_restart(&self, extractor: &str) {
+        self.lock_sent_blocks().clear();
+        self.send_to_all(DeltaCommand::ExtractorRestarted(extractor.to_string()))
+            .await;
+    }
+
+    /// Sends `msg` to the subscribers unless a replay drops it. A replay that differs from what
+    /// the subscribers received sends `ExtractorRestarted` first; a revert message is then dropped,
+    /// because the subscribers no longer hold the blocks it reverts.
+    async fn deliver(&self, msg: ExtractorMsg) {
+        let action = self.lock_sent_blocks().classify(&msg);
+        match action {
+            ReplayAction::Send => {}
+            ReplayAction::Skip => {
+                trace!(block = msg.block.number, "ReplaySkipsSentBlock");
+                return;
+            }
+            ReplayAction::Restart => {
+                warn!(
+                    block = msg.block.number,
+                    revert = msg.revert,
+                    "ReplayDiffers: the replay does not continue the blocks sent; restarting the \
+                     subscribers"
+                );
+                self.send_restart(&msg.extractor).await;
+                if msg.revert {
+                    return;
+                }
+            }
+        }
+        self.lock_sent_blocks().record(&msg);
+        self.send_to_all(DeltaCommand::Block(msg))
+            .await;
+    }
+
+    fn lock_sent_blocks(&self) -> std::sync::MutexGuard<'_, SentBlocks> {
+        // The record holds plain data, which a panic while it was locked cannot leave invalid.
+        self.sent_blocks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sends `command` to every subscriber. Waits for room only for an internal subscriber, and
+    /// removes a client subscriber whose channel is full, so a slow client cannot stall the
+    /// extractor for the other subscribers.
+    #[instrument(skip_all, fields(subscriber_count))]
+    async fn send_to_all(&self, command: DeltaCommand) {
+        let mut to_remove = Vec::new();
+        let mut subscribers = self.subscriptions.lock().await;
+        tracing::Span::current().record("subscriber_count", subscribers.len());
+
+        for (&subscriber_id, subscriber) in subscribers.iter() {
+            match subscriber
+                .deliver(command.clone())
+                .await
+            {
+                Delivery::Sent => {}
+                Delivery::Closed => {
+                    debug!(subscriber_id, kind = ?subscriber.kind, "Removed a closed subscriber");
+                    to_remove.push(subscriber_id);
+                }
+                Delivery::Full => {
+                    warn!(
+                        subscriber_id,
+                        kind = ?subscriber.kind,
+                        "Removed a client subscriber whose channel is full"
+                    );
+                    self.slow_client_removals.increment(1);
+                    to_remove.push(subscriber_id);
+                }
+            }
+        }
+
+        for subscriber_id in to_remove {
+            subscribers.remove(&subscriber_id);
+        }
+    }
+}
+
 pub struct ExtractorRunner {
     extractor: Arc<dyn Extractor>,
     substreams: SubstreamsStream,
     /// Subscribers — managed by the supervisor, shared across restarts.
-    subscriptions: Arc<Mutex<SubscriptionsMap>>,
+    subscribers: SubscriberChannels,
     /// Oneshot stop signal from the supervisor.
     stop_rx: oneshot::Receiver<()>,
     /// Handle of the tokio runtime on which the extraction tasks will be run.
@@ -272,7 +390,7 @@ impl ExtractorRunner {
     pub fn new(
         extractor: Arc<dyn Extractor>,
         substreams: SubstreamsStream,
-        subscriptions: Arc<Mutex<SubscriptionsMap>>,
+        subscribers: SubscriberChannels,
         stop_rx: oneshot::Receiver<()>,
         runtime_handle: Option<Handle>,
         partial_blocks: bool,
@@ -280,7 +398,7 @@ impl ExtractorRunner {
         ExtractorRunner {
             extractor,
             substreams,
-            subscriptions,
+            subscribers,
             stop_rx,
             runtime_handle,
             partial_blocks,
@@ -297,7 +415,6 @@ impl ExtractorRunner {
 
         runtime.spawn(async move {
             let id = self.extractor.get_id();
-            let slow_client_removals = slow_client_removals(&id);
             // Track the number of partials received for the current block != partial_index.
             let mut partials_in_block: u32 = 0;
             loop {
@@ -369,7 +486,7 @@ impl ExtractorRunner {
                                     })?;
                                     for msg in msgs {
                                         trace!("Propagating block data message.");
-                                        Self::propagate_msg(&self.subscriptions, msg, &slow_client_removals).await;
+                                        self.subscribers.deliver(msg).await;
                                     }
 
                                     let duration_ms = start_time.elapsed().as_millis() as f64;
@@ -392,7 +509,7 @@ impl ExtractorRunner {
                                     match self.extractor.handle_revert(undo_signal.clone()).await {
                                         Ok(Some(msg)) => {
                                             trace!("Propagating block undo message.");
-                                            Self::propagate_msg(&self.subscriptions, msg, &slow_client_removals).await;
+                                            self.subscribers.deliver(msg).await;
                                         }
                                         Ok(None) => {
                                             trace!("No message to propagate.");
@@ -485,50 +602,6 @@ impl ExtractorRunner {
         let mut copy: BlockAggregatedChanges = (**msg).clone();
         copy.partial_block_index = Some(0);
         Arc::new(copy)
-    }
-
-    // TODO: add message tracing_id to the log
-    #[instrument(skip_all, fields(subscriber_count))]
-    async fn propagate_msg(
-        subscribers: &Arc<Mutex<SubscriptionsMap>>,
-        message: ExtractorMsg,
-        slow_client_removals: &metrics::Counter,
-    ) {
-        trace!(msg = %message, "Propagating message to subscribers.");
-
-        let command = DeltaCommand::Block(message);
-
-        let mut to_remove = Vec::new();
-
-        // Lock the subscribers HashMap for exclusive access
-        let mut subscribers = subscribers.lock().await;
-        tracing::Span::current().record("subscriber_count", subscribers.len());
-
-        for (&subscriber_id, subscriber) in subscribers.iter() {
-            match subscriber
-                .deliver(command.clone())
-                .await
-            {
-                Delivery::Sent => {}
-                Delivery::Closed => {
-                    debug!(subscriber_id, kind = ?subscriber.kind, "Removed a closed subscriber");
-                    to_remove.push(subscriber_id);
-                }
-                Delivery::Full => {
-                    warn!(
-                        subscriber_id,
-                        kind = ?subscriber.kind,
-                        "Removed a client subscriber whose channel is full"
-                    );
-                    slow_client_removals.increment(1);
-                    to_remove.push(subscriber_id);
-                }
-            }
-        }
-
-        for subscriber_id in to_remove {
-            subscribers.remove(&subscriber_id);
-        }
     }
 }
 
@@ -711,8 +784,19 @@ mod test {
         (Subscriber { sender, kind }, rx)
     }
 
+    fn channels(
+        subscriptions: &Arc<Mutex<SubscriptionsMap>>,
+        slow_client_removals: &metrics::Counter,
+    ) -> SubscriberChannels {
+        SubscriberChannels {
+            subscriptions: subscriptions.clone(),
+            sent_blocks: Arc::default(),
+            slow_client_removals: slow_client_removals.clone(),
+        }
+    }
+
     #[tokio::test]
-    async fn test_propagate_msg_removes_full_client_without_waiting() {
+    async fn test_send_to_all_removes_full_client_without_waiting() {
         let (full_client, mut full_client_rx) = subscriber(client_kind(), 1, 1);
         let (client, mut client_rx) = subscriber(client_kind(), 4, 0);
         let (internal, mut internal_rx) = subscriber(SubscriberKind::Internal, 4, 0);
@@ -721,7 +805,8 @@ mod test {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            ExtractorRunner::propagate_msg(&subscribers, one_msg(), &metrics::Counter::noop()),
+            channels(&subscribers, &metrics::Counter::noop())
+                .send_to_all(DeltaCommand::Block(one_msg())),
         )
         .await
         .expect("a full client must not make the extractor wait");
@@ -744,14 +829,15 @@ mod test {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_propagate_msg_waits_for_full_internal_subscriber() {
+    async fn test_send_to_all_waits_for_full_internal_subscriber() {
         let (internal, mut internal_rx) = subscriber(SubscriberKind::Internal, 1, 1);
         let subscribers = Arc::new(Mutex::new(HashMap::from([(0, internal)])));
 
         let propagate = tokio::spawn({
             let subscribers = subscribers.clone();
             async move {
-                ExtractorRunner::propagate_msg(&subscribers, one_msg(), &metrics::Counter::noop())
+                channels(&subscribers, &metrics::Counter::noop())
+                    .send_to_all(DeltaCommand::Block(one_msg()))
                     .await
             }
         });
@@ -762,7 +848,7 @@ mod test {
         tokio::time::timeout(Duration::from_secs(1), propagate)
             .await
             .expect("room in the channel unblocks the extractor")
-            .expect("propagate_msg must not panic");
+            .expect("send_to_all must not panic");
         assert!(matches!(internal_rx.recv().await, Some(DeltaCommand::Block(_))));
         assert!(subscribers
             .lock()
@@ -814,7 +900,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_propagate_msg_counts_only_full_clients() {
+    async fn test_send_to_all_counts_only_full_clients() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let id = ExtractorIdentity::new(Chain::Ethereum, "uniswap_v2");
@@ -829,7 +915,9 @@ mod test {
             (2, client),
         ])));
 
-        ExtractorRunner::propagate_msg(&subscribers, one_msg(), &removals).await;
+        channels(&subscribers, &removals)
+            .send_to_all(DeltaCommand::Block(one_msg()))
+            .await;
 
         assert_eq!(slow_client_removals_series(&snapshotter), vec![(uniswap_v2_labels(), 1)]);
         let remaining: Vec<u64> = subscribers
